@@ -7,10 +7,45 @@
     get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* 저장 불가(사생활 모드 등) */ } },
   };
-  const PKEY = 'vp-progress-v1';
+  /* ── 공부 기록: 항목마다 고친 시각(meta)을 함께 저장 → 여러 기기 기록을 항목 단위로 합친다 ── */
+  const PKEY = 'vp-progress-v1', MKEY = 'vp-progress-meta-v1';
   const prog = store.get(PKEY, {});
-  const saveProg = () => store.set(PKEY, prog);
+  const J = (v) => JSON.stringify(v);
+  const canon = (o) => J(Object.keys(o).sort().map((k) => [k, o[k]]));
+  const PARTS = ['c', 'cp', 'o', 'ov'];
+  function flat(p) {
+    const f = {};
+    for (const code in p) {
+      if (code === '_last') { if (p._last) f._last = p._last; continue; }
+      for (const part of PARTS) { const d = p[code] && p[code][part]; if (d) for (const k in d) f[code + '|' + part + '|' + k] = d[k]; }
+    }
+    return f;
+  }
+  function unflat(f) {
+    const p = {};
+    for (const key in f) {
+      if (key === '_last') { p._last = f._last; continue; }
+      const a = key.indexOf('|'), b = key.indexOf('|', a + 1);
+      const code = key.slice(0, a), part = key.slice(a + 1, b), k = key.slice(b + 1);
+      const u = (p[code] = p[code] || { c: {}, o: {} });
+      (u[part] = u[part] || {})[k] = f[key];
+    }
+    return p;
+  }
+  let snap = flat(prog);
+  let meta = store.get(MKEY, null);
+  if (!meta) { meta = {}; for (const k in snap) meta[k] = 1; store.set(MKEY, meta); } // 예전 기록은 '아주 오래된' 것으로
+  let onProgSaved = () => {};
+  function saveProg() {
+    const now = Date.now(), f = flat(prog);
+    for (const k in f) if (!(k in snap) || J(f[k]) !== J(snap[k])) meta[k] = now;
+    for (const k in snap) if (!(k in f)) meta[k] = now; // 지운 항목도 시각을 남겨 다른 기기에서 되살아나지 않게
+    snap = f; store.set(PKEY, prog); store.set(MKEY, meta);
+    onProgSaved();
+  }
+  function replaceProg(np) { Object.keys(prog).forEach((k) => delete prog[k]); Object.assign(prog, np); }
   const unitProg = (code) => (prog[code] = prog[code] || { c: {}, o: {} });
+  const restorers = []; // 기록이 바뀌면 화면을 다시 칠하는 함수들
 
   /* ── 테마 ── */
   const curTheme = () => document.documentElement.dataset.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
@@ -73,6 +108,19 @@
   window.addEventListener('hashchange', route);
   route();
 
+  /* ── 마지막으로 본 곳(이어서 공부하기) ── */
+  const unitCode = (location.pathname.match(/\/u\/([A-Za-z0-9]+)\.html$/) || [])[1];
+  function setLast(sec) {
+    if (!unitCode) return;
+    const t = $('.ab-title b'), title = t ? t.textContent.trim() : unitCode;
+    const h = sec ? $(`#s-${sec} .sec-h h2`) : null;
+    const href = `u/${unitCode}.html` + (sec ? `#s-${sec}` : '');
+    if (prog._last && prog._last.href === href) return;
+    prog._last = { href, unit: title, sec: sec ? `개념 ${sec}. ${h ? h.textContent.trim() : ''}` : '' };
+    saveProg();
+  }
+  if (unitCode && !(prog._last && prog._last.href.startsWith(`u/${unitCode}.html`))) setLast(null);
+
   /* ── 지금 보는 절 표시 ── */
   const secs = $$('.sec[id^="s-"]');
   if (secs.length && 'IntersectionObserver' in window) {
@@ -84,6 +132,7 @@
         if (!en.isIntersecting) return;
         const n = en.target.dataset.sec;
         if (n === cur) return; cur = n;
+        setLast(n);
         links.forEach((l) => l.classList.toggle('on', l.dataset.secLink === n));
         const chip = chipBox && chipBox.querySelector(`[data-sec-link="${n}"]`);
         if (chip && chipBox.scrollWidth > chipBox.clientWidth) {
@@ -186,15 +235,22 @@
   }
   $$('.quiz').forEach((q) => {
     const code = q.dataset.qid.split('-')[0];
-    const saved = (prog[code] && prog[code].cp) ? prog[code].cp[q.dataset.qid] : undefined;
-    if (saved !== undefined) markQuiz(q, saved, false);
+    const clear = () => {
+      $$('.qc', q).forEach((b) => b.classList.remove('correct', 'wrong'));
+      $('.qcs', q).classList.remove('done'); $('.quiz-why', q).hidden = true;
+    };
+    const restore = () => {
+      clear();
+      const saved = (prog[code] && prog[code].cp) ? prog[code].cp[q.dataset.qid] : undefined;
+      if (saved !== undefined) markQuiz(q, saved, false);
+    };
+    restore(); restorers.push(restore);
     $$('.qc', q).forEach((b) => b.addEventListener('click', () => {
       if ($('.qcs', q).classList.contains('done')) return;
       markQuiz(q, +b.dataset.i, true);
     }));
     $('.quiz-retry', q).addEventListener('click', () => {
-      $$('.qc', q).forEach((b) => b.classList.remove('correct', 'wrong'));
-      $('.qcs', q).classList.remove('done'); $('.quiz-why', q).hidden = true;
+      clear();
       const up = unitProg(code); delete up.c[q.dataset.qid]; if (up.cp) delete up.cp[q.dataset.qid]; saveProg();
     });
   });
@@ -214,30 +270,52 @@
       b.textContent = ok ? `정답 (${ans})` : `틀렸어요 — 정답 ${ans}`; b.className = ok ? 'ok' : 'no'; why.hidden = false;
       if (save) { unitProg(code).o[it.dataset.k] = ok ? 1 : 0; saveProg(); upd(); }
     };
-    const savedO = (prog[code] && prog[code].ov) || {};
+    const clearAll = () => items.forEach((it) => { it.classList.remove('done'); $$('.ox-b', it).forEach((b) => b.classList.remove('ok', 'no', 'ans')); $('.ox-why', it).hidden = true; });
+    const restore = () => {
+      clearAll();
+      const savedO = (prog[code] && prog[code].ov) || {};
+      items.forEach((it) => { if (savedO[it.dataset.k]) mark(it, savedO[it.dataset.k], false); });
+      upd();
+    };
+    restore(); restorers.push(restore);
     items.forEach((it) => {
-      if (savedO[it.dataset.k]) mark(it, savedO[it.dataset.k], false);
       $$('.ox-b', it).forEach((b) => b.addEventListener('click', () => {
         if (it.classList.contains('done')) return;
+        const up = unitProg(code); up.ov = up.ov || {}; up.ov[it.dataset.k] = b.dataset.v;
         mark(it, b.dataset.v, true);
-        const up = unitProg(code); up.ov = up.ov || {}; up.ov[it.dataset.k] = b.dataset.v; saveProg();
       }));
     });
     $('.ox-reset', box).addEventListener('click', () => {
-      items.forEach((it) => { it.classList.remove('done'); $$('.ox-b', it).forEach((b) => b.classList.remove('ok', 'no', 'ans')); $('.ox-why', it).hidden = true; });
+      clearAll();
       const up = unitProg(code); up.o = {}; up.ov = {}; saveProg(); upd();
     });
-    upd();
   });
 
   /* ── 홈: 진도 막대 ── */
-  $$('.ucard[data-code]').forEach((c) => {
-    const p = prog[c.dataset.code]; const total = +c.dataset.total || 0;
-    if (!p || !total) return;
-    const done = Object.keys(p.c || {}).length + Object.keys(p.o || {}).length;
-    const bar = $('.uc-bar i', c); if (bar) bar.style.width = Math.min(100, Math.round(done / total * 100)) + '%';
-    const m = $('.uc-m', c); if (m && done) m.insertAdjacentHTML('beforeend', ` · <b style="color:var(--acc)">${Math.min(done, total)}/${total} 풀이</b>`);
-  });
+  function paintHome() {
+    $$('.ucard[data-code]').forEach((c) => {
+      const p = prog[c.dataset.code]; const total = +c.dataset.total || 0;
+      const done = p ? Object.keys(p.c || {}).length + Object.keys(p.o || {}).length : 0;
+      const bar = $('.uc-bar i', c); if (bar) bar.style.width = total ? Math.min(100, Math.round(done / total * 100)) + '%' : '0%';
+      const m = $('.uc-m', c); if (!m) return;
+      let sp = $('.uc-done', m);
+      if (!sp) { sp = document.createElement('span'); sp.className = 'uc-done'; m.appendChild(sp); }
+      sp.innerHTML = done && total ? ` · <b>${Math.min(done, total)}/${total} 풀이</b>` : '';
+    });
+  }
+  function paintResume() {
+    const hero = $('.hero-home'); if (!hero) return;
+    let a = $('.resume', hero); const L = prog._last;
+    if (!L) { if (a) a.remove(); return; }
+    if (!a) {
+      a = document.createElement('a'); a.className = 'resume';
+      a.innerHTML = '<span class="rs-k">이어서 공부하기</span><span class="rs-t"><b></b><small></small></span><span class="rs-go" aria-hidden="true">→</span>';
+      const ch = $('.chips', hero); if (ch) ch.after(a); else hero.appendChild(a);
+    }
+    a.href = L.href; $('b', a).textContent = L.unit || ''; $('small', a).textContent = L.sec || '';
+  }
+  paintHome(); paintResume();
+  restorers.push(paintHome, paintResume);
 
   /* ── 홈: 개념 검색 ── */
   const q = $('#q'), res = $('#search-res'), idxEl = $('#search-index');
@@ -271,4 +349,171 @@
     window.addEventListener('scroll', onS, { passive: true }); onS();
     tt.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
   }
+
+  /* ── 기기 간 동기화: 내 GitHub 비공개 gist 하나에 기록을 저장·병합 ── */
+  const TKEY = 'vp-sync-token', GKEY = 'vp-sync-gist', LKEY = 'vp-sync-login', SKEY = 'vp-sync-last';
+  const API = 'https://api.github.com', FILE = 'visual-physics-progress.json';
+  const TOKEN_URL = 'https://github.com/settings/tokens/new?scopes=gist&description=' + encodeURIComponent('그림 물리 공부 기록');
+  let token = store.get(TKEY, null), busy = false, again = false, timer = 0, state = token ? 'idle' : 'off', errMsg = '';
+  let lastOk = store.get(SKEY, 0);
+
+  async function gh(path, opt = {}, tk = token) {
+    const headers = { Accept: 'application/vnd.github+json', Authorization: 'Bearer ' + tk };
+    if (opt.body) headers['Content-Type'] = 'application/json';
+    const r = await fetch(API + path, Object.assign({ cache: 'no-store' }, opt, { headers }));
+    if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
+    return r.status === 204 ? null : r.json();
+  }
+  function mergeState(lf, lm, rf, rm) {
+    const keys = new Set([...Object.keys(lf), ...Object.keys(lm), ...Object.keys(rf), ...Object.keys(rm)]);
+    const f = {}, m = {};
+    keys.forEach((k) => {
+      const lt = lm[k] || 0, rt = rm[k] || 0, src = rt > lt ? rf : lf;
+      m[k] = Math.max(lt, rt); if (k in src) f[k] = src[k];
+    });
+    return { f, m };
+  }
+  async function findGist() {
+    const id = store.get(GKEY, null); if (id) return id;
+    for (let page = 1; page <= 10; page++) {
+      const list = await gh(`/gists?per_page=100&page=${page}`);
+      const g = list.find((x) => x.files && x.files[FILE]);
+      if (g) { store.set(GKEY, g.id); return g.id; }
+      if (list.length < 100) break;
+    }
+    return null;
+  }
+  async function readGist(id) {
+    const g = await gh('/gists/' + id), fl = g.files && g.files[FILE];
+    if (!fl) return { f: {}, m: {} };
+    let txt = fl.content;
+    if (fl.truncated) txt = await (await fetch(fl.raw_url, { cache: 'no-store' })).text();
+    const d = JSON.parse(txt || '{}');
+    return { f: d.flat || {}, m: d.meta || {} };
+  }
+  async function syncNow() {
+    if (!token) return;
+    if (busy) { again = true; return; }
+    busy = true; clearTimeout(timer); timer = 0; setState('busy');
+    try {
+      let id = await findGist(), remote = { f: {}, m: {} };
+      if (id) {
+        try { remote = await readGist(id); }
+        catch (e) { if (e.status === 404) { store.set(GKEY, null); id = await findGist(); if (id) remote = await readGist(id); } else throw e; }
+      }
+      const lf = flat(prog), M = mergeState(lf, meta, remote.f, remote.m);
+      if (canon(M.f) !== canon(lf)) { replaceProg(unflat(M.f)); snap = flat(prog); store.set(PKEY, prog); restorers.forEach((fn) => fn()); }
+      meta = M.m; store.set(MKEY, meta);
+      if (!id || canon(M.f) !== canon(remote.f) || canon(M.m) !== canon(remote.m)) {
+        const content = J({ v: 1, updated: new Date().toISOString(), flat: M.f, meta: M.m });
+        if (id) await gh('/gists/' + id, { method: 'PATCH', body: J({ files: { [FILE]: { content } } }) });
+        else {
+          const g = await gh('/gists', { method: 'POST', body: J({ description: '그림 물리 공부 기록 (자동 동기화 · 지우면 기록이 사라져요)', public: false, files: { [FILE]: { content } } }) });
+          store.set(GKEY, g.id);
+        }
+      }
+      lastOk = Date.now(); store.set(SKEY, lastOk); errMsg = ''; setState('ok');
+    } catch (e) {
+      errMsg = e.status === 401 ? '토큰이 만료되었거나 잘못됐어요. 연결을 끊고 새 토큰을 넣어 주세요.'
+        : (e.status === 403 || e.status === 404) ? '토큰에 gist 권한이 없어요. gist 를 체크해서 다시 만들어 주세요.'
+        : '인터넷 연결을 확인해 주세요. 기록은 이 기기에 남아 있고 다음에 다시 맞춰요.';
+      setState('err');
+    } finally {
+      busy = false;
+      if (again) { again = false; schedule(800); }
+    }
+  }
+  function schedule(ms = 2500) { if (!token) return; clearTimeout(timer); timer = setTimeout(syncNow, ms); }
+  onProgSaved = () => schedule();
+  document.addEventListener('visibilitychange', () => {
+    if (!token) return;
+    if (document.visibilityState === 'hidden') { if (timer) syncNow(); }
+    else if (Date.now() - lastOk > 15000) syncNow();
+  });
+  window.addEventListener('online', () => schedule(500));
+
+  /* 동기화 버튼·창 */
+  const bar = $('.appbar'), themeBtn = bar && $('[data-theme-toggle]', bar);
+  const ago = (t) => { if (!t) return '아직 없음'; const s = (Date.now() - t) / 1000; if (s < 60) return '방금'; if (s < 3600) return Math.floor(s / 60) + '분 전'; const d = new Date(t); return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+  let modal = null, syncBtn = null;
+  function setState(s) {
+    state = s;
+    if (syncBtn) { syncBtn.dataset.state = s; syncBtn.setAttribute('aria-label', '기기 간 기록 동기화 — ' + ({ off: '꺼짐', idle: '켜짐', busy: '맞추는 중', ok: '맞춤 완료', err: '문제 있음' }[s])); }
+    if (modal && !modal.hidden) renderModal();
+    const cta = $('.sync-cta'); if (cta) cta.hidden = !!token;
+  }
+  function renderModal() {
+    const body = $('.sync-body', modal);
+    if (!token) {
+      body.innerHTML = `<p>푼 문제·OX·이어서 볼 위치를 <b>내 GitHub 계정의 비공개 gist</b>에 저장해서, 폰·태블릿·컴퓨터 어디서 열어도 이어서 공부할 수 있어요.</p>
+<ol class="sync-steps">
+<li><a href="${TOKEN_URL}" target="_blank" rel="noopener">GitHub 토큰 만들기 ↗</a><br>‘gist’만 체크된 채로 열려요. Expiration(만료)을 고르고 맨 아래 <b>Generate token</b> → 나온 <code>ghp_…</code> 를 복사하세요.</li>
+<li>아래 칸에 붙여넣고 <b>연결</b>을 누르세요.</li>
+<li>다른 기기에서도 한 번씩 같은 토큰을 넣으면 끝이에요. (그 기기에서 토큰을 새로 만들어도 같은 계정이면 기록이 합쳐져요.)</li>
+</ol>
+<div class="sync-row"><input class="sync-in" type="password" placeholder="ghp_… 토큰 붙여넣기" autocomplete="off" spellcheck="false"><button class="sync-b primary sync-go" type="button">연결</button></div>
+<p class="sync-msg" role="status"></p>
+<p class="sync-note">토큰은 이 기기의 브라우저에만 저장돼요. gist 권한만 있는 토큰이라 저장소나 계정 설정은 건드릴 수 없어요. 공용 컴퓨터에서는 다 쓴 뒤 연결을 끊어 주세요.</p>`;
+      const inp = $('.sync-in', body), go = $('.sync-go', body), msg = $('.sync-msg', body);
+      const connect = async () => {
+        const tk = inp.value.trim(); if (!tk) { inp.focus(); return; }
+        go.disabled = true; msg.className = 'sync-msg'; msg.textContent = '확인하는 중…';
+        try {
+          const u = await gh('/user', {}, tk);
+          await gh('/gists?per_page=1', {}, tk); // gist 권한 확인
+          token = tk; store.set(TKEY, tk); store.set(LKEY, u.login); store.set(GKEY, null);
+          renderModal(); await syncNow();
+        } catch (e) {
+          go.disabled = false; msg.className = 'sync-msg bad';
+          msg.textContent = e.status === 401 ? '토큰이 맞지 않아요. 다시 복사해 붙여넣어 주세요.' : (e.status === 403 || e.status === 404) ? 'gist 권한이 없는 토큰이에요. gist 를 체크해서 다시 만들어 주세요.' : '연결하지 못했어요. 인터넷 연결을 확인해 주세요.';
+        }
+      };
+      go.addEventListener('click', connect);
+      inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); });
+      setTimeout(() => inp.focus(), 50);
+    } else {
+      const login = store.get(LKEY, '');
+      const st = state === 'busy' ? '맞추는 중…' : state === 'err' ? errMsg : `마지막 동기화: ${ago(lastOk)}`;
+      body.innerHTML = `<p class="sync-on"><span class="sync-ok-i" aria-hidden="true"></span><b>${login ? '@' + login.replace(/[<>&]/g, '') : 'GitHub'}</b> 계정과 연결됨</p>
+<p class="sync-msg ${state === 'err' ? 'bad' : ''}" role="status">${st}</p>
+<p>문제를 풀면 몇 초 뒤 자동으로 저장되고, 다른 기기에서 이 사이트를 열면 자동으로 이어져요.</p>
+<div class="sync-row"><button class="sync-b primary sync-now" type="button" ${state === 'busy' ? 'disabled' : ''}>지금 동기화</button><button class="sync-b sync-off" type="button">이 기기에서 연결 끊기</button></div>
+<p class="sync-note">연결을 끊어도 이 기기의 기록은 그대로 남아요. 기록 원본은 GitHub gist 의 ‘${FILE}’ 이에요.</p>`;
+      $('.sync-now', body).addEventListener('click', syncNow);
+      $('.sync-off', body).addEventListener('click', () => {
+        token = null; [TKEY, GKEY, LKEY].forEach((k) => { try { localStorage.removeItem(k); } catch (e) { /* */ } });
+        clearTimeout(timer); setState('off'); renderModal();
+      });
+    }
+  }
+  function openModal() {
+    if (!modal) {
+      modal = document.createElement('div'); modal.className = 'sync-modal'; modal.hidden = true;
+      modal.innerHTML = `<div class="sync-card" role="dialog" aria-modal="true" aria-labelledby="sync-h">
+<div class="sync-top"><h2 id="sync-h">기기 간 기록 동기화</h2><button class="ab-btn sync-x" type="button" aria-label="닫기"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg></button></div>
+<div class="sync-body"></div></div>`;
+      document.body.appendChild(modal);
+      $('.sync-x', modal).addEventListener('click', closeModal);
+      modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+      document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && modal && !modal.hidden) closeModal(); });
+    }
+    modal.hidden = false; document.body.classList.add('lb-open'); renderModal();
+  }
+  function closeModal() { if (modal) { modal.hidden = true; document.body.classList.remove('lb-open'); } }
+  if (bar && themeBtn) {
+    syncBtn = document.createElement('button');
+    syncBtn.className = 'ab-btn ab-sync'; syncBtn.type = 'button';
+    syncBtn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18.5h10.2a4.3 4.3 0 0 0 .6-8.56A6 6 0 0 0 6.3 9.1 4.7 4.7 0 0 0 7 18.5z" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/><path d="M9.6 13.6l1.8 1.8 3.4-3.6" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" class="i-chk"/></svg><i class="sync-dot"></i>';
+    themeBtn.before(syncBtn);
+    syncBtn.addEventListener('click', openModal);
+  }
+  const heroSearch = $('.hero-home .search');
+  if (heroSearch) {
+    const cta = document.createElement('button'); cta.type = 'button'; cta.className = 'sync-cta';
+    cta.innerHTML = '폰·태블릿·컴퓨터에서 기록 이어가기 <span aria-hidden="true">→</span>';
+    cta.addEventListener('click', openModal); heroSearch.after(cta);
+  }
+  setState(state);
+  if (token) syncNow();
+
 })();
